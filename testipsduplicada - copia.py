@@ -1,10 +1,9 @@
-import streamlit as st
 import paramiko
 import pandas as pd
+import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import socket
 import time
-import io
 
 class NetworkDeviceScanner:
     def __init__(self, username, password):
@@ -18,10 +17,13 @@ class NetworkDeviceScanner:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            ssh.connect(device_ip, username=self.username, password=self.password,
-                        timeout=self.ssh_timeout, banner_timeout=20)
+            ssh.connect(device_ip,
+                        username=self.username,
+                        password=self.password,
+                        timeout=self.ssh_timeout,
+                        banner_timeout=20)
             return ssh
-        except:
+        except Exception as e:
             return None
 
     def execute_command(self, ssh, command):
@@ -35,7 +37,7 @@ class NetworkDeviceScanner:
     def check_duplicate_ip(self, device_ip, device_type, target_ip):
         ssh = self.connect_to_device(device_ip, device_type)
         if not ssh:
-            return None, None
+            return device_ip, None
 
         try:
             if 'huawei' in device_type:
@@ -54,46 +56,57 @@ class NetworkDeviceScanner:
         finally:
             ssh.close()
 
-    def process_devices(self, excel_data, target_ip):
-        df = pd.read_excel(excel_data)
-        devices = [(str(row[0]), str(row[1]).lower()) for _, row in df.iterrows()]
-        found_devices = []
+    def process_devices(self, file, target_ip):
+        try:
+            df = pd.read_excel(file)
+            devices = [(str(row[0]), str(row[1]).lower()) for _, row in df.iterrows()]
+        except Exception as e:
+            st.error(f"Error al leer el archivo Excel: {str(e)}")
+            return []
 
+        found_devices = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {
-                executor.submit(self.check_duplicate_ip, ip, tipo, target_ip): ip
-                for ip, tipo in devices
+                executor.submit(
+                    self.check_duplicate_ip,
+                    device_ip,
+                    device_type,
+                    target_ip
+                ): (device_ip, device_type)
+                for device_ip, device_type in devices
             }
+
             for future in as_completed(futures):
-                device_ip = futures[future]
+                device_ip, device_type = futures[future]
                 try:
                     result_ip, output = future.result()
                     if output:
-                        found_devices.append((result_ip, output))
-                except:
-                    continue
+                        found_devices.append((result_ip, device_type, output))
+                except Exception as e:
+                    st.warning(f"Error procesando {device_ip}: {str(e)}")
+
         return found_devices
 
-# STREAMLIT UI
-st.title("🔍 Verificador de IP Duplicada en Equipos de Red")
-st.write("Sube un Excel con los dispositivos y escribe la IP que deseas verificar.")
+# Streamlit interface
+st.title("🔎 Buscador de IP Duplicadas en Equipos de Red")
 
-uploaded_file = st.file_uploader("📄 Archivo Excel (.xlsx)", type=["xlsx"])
-target_ip = st.text_input("🔢 IP a verificar")
-username = st.text_input("👤 Usuario SSH", type="default")
-password = st.text_input("🔐 Contraseña SSH", type="password")
+username = st.text_input("Usuario SSH", value="juribeb")
+password = st.text_input("Contraseña SSH", type="password")
+target_ip = st.text_input("IP a buscar", value="172.20.142.101")
+file = st.file_uploader("Sube el archivo Excel de equipos", type=["xlsx"])
 
-if st.button("Iniciar búsqueda"):
-    if uploaded_file and target_ip and username and password:
-        scanner = NetworkDeviceScanner(username, password)
-        with st.spinner("Buscando..."):
-            results = scanner.process_devices(uploaded_file, target_ip)
-        if results:
-            st.success(f"✅ IP {target_ip} encontrada en {len(results)} dispositivo(s):")
-            for ip, output in results:
-                st.markdown(f"**{ip}**")
-                st.code(output)
-        else:
-            st.warning("IP no encontrada en ningún dispositivo.")
+if st.button("Buscar IP duplicada"):
+    if not file or not username or not password or not target_ip:
+        st.error("Por favor completa todos los campos.")
     else:
-        st.error("Completa todos los campos para continuar.")
+        with st.spinner("Procesando dispositivos..."):
+            scanner = NetworkDeviceScanner(username, password)
+            resultados = scanner.process_devices(file, target_ip)
+
+        if resultados:
+            st.success(f"¡IP duplicada encontrada en {len(resultados)} dispositivos!")
+            for ip, tipo, salida in resultados:
+                st.markdown(f"### {ip} ({tipo})")
+                st.code(salida)
+        else:
+            st.info("No se encontró la IP en ningún dispositivo.")
