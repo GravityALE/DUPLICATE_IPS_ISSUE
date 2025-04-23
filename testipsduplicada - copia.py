@@ -12,9 +12,9 @@ class NetworkDeviceScanner:
     def __init__(self, username, password):
         self.username = username
         self.password = password
-        self.ssh_timeout = 10
-        self.command_timeout = 15
-        self.max_workers = 10
+        self.ssh_timeout = 15  # Aumentado para dispositivos lentos
+        self.command_timeout = 20
+        self.max_workers = 8  # Reducido para mayor estabilidad
         self.log_queue = queue.Queue()
         self.progress_queue = queue.Queue()
         self.results_queue = queue.Queue()
@@ -40,7 +40,7 @@ class NetworkDeviceScanner:
                       username=self.username, 
                       password=self.password, 
                       timeout=self.ssh_timeout,
-                      banner_timeout=30,
+                      banner_timeout=45,
                       look_for_keys=False,
                       allow_agent=False)
             self.log_message(f"Conexión exitosa a {device_ip}", "success")
@@ -51,6 +51,7 @@ class NetworkDeviceScanner:
 
     def execute_command(self, ssh, command, device_ip):
         try:
+            self.log_message(f"Ejecutando en {device_ip}: {command}")
             stdin, stdout, stderr = ssh.exec_command(command, timeout=self.command_timeout)
             output = stdout.read().decode('utf-8', errors='ignore').strip()
             error = stderr.read().decode('utf-8', errors='ignore').strip()
@@ -69,27 +70,35 @@ class NetworkDeviceScanner:
             return None
         
         try:
+            # Comandos mejorados para cada tipo de dispositivo
             if 'huawei' in device_type.lower():
-                command = f"display ip routing-table {target_ip}"
-                search_patterns = [f"{target_ip}/", "Routing Table"]
+                command = f"display ip routing-table | include {target_ip}"
+                search_patterns = [f"{target_ip}/", "Routing Table", target_ip]
             elif 'xe' in device_type.lower():
-                command = f"show ip route {target_ip}"
-                search_patterns = ["is directly connected", "is subnetted", f" {target_ip} "]
+                command = f"show ip route {target_ip} | include {target_ip}"
+                search_patterns = [f" {target_ip} ", "directly connected", "subnetted"]
             elif 'xr' in device_type.lower():
-                command = f"show route {target_ip}"
-                search_patterns = [f" {target_ip}/", "Routing entry for"]
+                command = f"show route {target_ip} | include {target_ip}"
+                search_patterns = [f" {target_ip}/", "Routing entry"]
             else:
                 self.log_message(f"Tipo no reconocido: {device_type}", "warning")
                 return None
             
             output = self.execute_command(ssh, command, device_ip)
             
-            if output and any(pattern in output for pattern in search_patterns):
-                self.add_result(device_ip, device_type, output)
-                self.log_message(f"¡COINCIDENCIA ENCONTRADA en {device_ip}!", "success")
-                return True
+            # Análisis más exhaustivo de la salida
+            if output:
+                self.log_message(f"Respuesta completa de {device_ip}:\n{output}", "debug")
+                
+                if any(pattern in output for pattern in search_patterns):
+                    self.add_result(device_ip, device_type, output)
+                    self.log_message(f"¡COINCIDENCIA CONFIRMADA en {device_ip}!", "success")
+                    return True
             
-            self.log_message(f"IP no encontrada en {device_ip}")
+            self.log_message(f"IP no encontrada en {device_ip}", "info")
+            return False
+        except Exception as e:
+            self.log_message(f"Error procesando {device_ip}: {str(e)}", "warning")
             return False
         finally:
             if ssh:
@@ -98,12 +107,14 @@ class NetworkDeviceScanner:
     def process_devices(self, excel_data, target_ip):
         try:
             df = pd.read_excel(BytesIO(excel_data))
-            devices = [(str(row['IP']), str(row['Tipo']).lower()) for _, row in df.iterrows()]
+            df['IP'] = df['IP'].astype(str).str.strip()
+            df['Tipo'] = df['Tipo'].astype(str).str.strip().str.lower()
+            devices = [(row['IP'], row['Tipo']) for _, row in df.iterrows()]
         except Exception as e:
             self.log_message(f"Error al leer Excel: {str(e)}", "error")
             return False
         
-        self.log_message(f"Iniciando búsqueda de {target_ip} en {len(devices)} dispositivos")
+        self.log_message(f"Iniciando búsqueda precisa de {target_ip} en {len(devices)} dispositivos")
         
         start_time = time.time()
         total_devices = len(devices)
@@ -158,36 +169,38 @@ def display_ui_updates(log_placeholder, progress_bar, progress_text, results_are
             result_type, *data = scanner.results_queue.get()
             if result_type == "found":
                 device_ip, device_type, output = data
-                with results_area.expander(f"✅ Coincidencia en {device_ip} ({device_type})", expanded=True):
-                    st.code(output)
+                with results_area.expander(f"✅ IP encontrada en {device_ip} ({device_type})", expanded=True):
+                    st.text_area("Salida del comando:", value=output, height=200)
             elif result_type == "summary":
                 found_count, total_devices, target_ip = data
                 if found_count > 0:
-                    results_area.success(f"🎯 Se encontró {target_ip} en {found_count} dispositivos")
+                    results_area.success(f"🎯 La IP {target_ip} se encontró en {found_count} dispositivo(s)")
                 else:
-                    results_area.warning(f"La IP {target_ip} no se encontró en ninguno de los {total_devices} dispositivos")
+                    results_area.warning(f"La IP {target_ip} no se encontró en los {total_devices} dispositivos escaneados")
         
         time.sleep(0.1)
 
 def main():
-    st.set_page_config(page_title="Buscador de IP en Red", layout="wide")
-    st.title("🔍 Buscador de IP en Dispositivos de Red")
+    st.set_page_config(page_title="Buscador Avanzado de IP", layout="wide")
+    st.title("🔍 Buscador Avanzado de IP en Red")
     
     with st.sidebar:
         st.header("Credenciales SSH")
         username = st.text_input("Usuario", "juribeb")
         password = st.text_input("Contraseña", type="password")
+        st.markdown("---")
+        st.info("Asegúrese que los tipos de dispositivo sean: Huawei, IOS XE o IOS XR")
     
     uploaded_file = st.file_uploader("Sube archivo Excel con dispositivos", type=['xlsx'])
     
     if uploaded_file:
         target_ip = st.text_input("IP a buscar", "172.20.142.85")
         
-        if st.button("Iniciar Búsqueda"):
+        if st.button("🔎 Iniciar Búsqueda Profunda", use_container_width=True):
             # Configurar áreas de visualización
             progress_bar = st.progress(0)
             progress_text = st.empty()
-            log_container = st.expander("📝 Logs de Ejecución", expanded=True)
+            log_container = st.expander("📝 Logs Detallados", expanded=True)
             log_placeholder = log_container.empty()
             results_area = st.container()
             
@@ -198,9 +211,10 @@ def main():
                 try:
                     has_matches = scanner.process_devices(uploaded_file.read(), target_ip)
                     if not has_matches:
-                        scanner.results_queue.put(("summary", 0, len(pd.read_excel(BytesIO(uploaded_file.read()))), target_ip))
+                        df = pd.read_excel(BytesIO(uploaded_file.read()))
+                        scanner.results_queue.put(("summary", 0, len(df), target_ip))
                 except Exception as e:
-                    log_placeholder.error(f"Error en el escaneo: {str(e)}")
+                    log_placeholder.error(f"Error crítico: {str(e)}")
             
             import threading
             scan_thread = threading.Thread(target=run_scan)
