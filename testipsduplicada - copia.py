@@ -216,8 +216,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-            # Procesar cualquier mensaje restante
-            display_logs_and_progress(log_placeholder, progress_bar, progress_text, scanner)
-
-if __name__ == "__main__":
-    main()
