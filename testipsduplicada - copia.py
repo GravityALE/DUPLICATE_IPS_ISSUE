@@ -5,13 +5,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import socket
 import time
 from io import BytesIO
-import logging
-from datetime import datetime
 import queue
-
-# Configuración básica de logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from datetime import datetime
 
 class NetworkDeviceScanner:
     def __init__(self, username, password):
@@ -22,20 +17,20 @@ class NetworkDeviceScanner:
         self.max_workers = 10
         self.log_queue = queue.Queue()
         self.progress_queue = queue.Queue()
+        self.results_queue = queue.Queue()
 
     def log_message(self, message, level="info"):
-        """Envía mensajes a la cola para ser procesados por el hilo principal"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted_msg = f"[{timestamp}] {message}"
         self.log_queue.put((level, formatted_msg))
-        logger.log(getattr(logging, level.upper()), formatted_msg)
 
     def update_progress(self, current, total):
-        """Actualiza el progreso a través de la cola"""
         self.progress_queue.put((current, total))
 
+    def add_result(self, device_ip, device_type, output):
+        self.results_queue.put(("found", device_ip, device_type, output))
+
     def connect_to_device(self, device_ip, device_type):
-        """Establece conexión SSH con el dispositivo"""
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
@@ -50,95 +45,69 @@ class NetworkDeviceScanner:
                       allow_agent=False)
             self.log_message(f"Conexión exitosa a {device_ip}", "success")
             return ssh
-        except socket.timeout:
-            self.log_message(f"Timeout al conectar a {device_ip} ({device_type})", "warning")
-            return None
         except Exception as e:
-            self.log_message(f"Error al conectar a {device_ip} ({device_type}): {str(e)}", "warning")
+            self.log_message(f"Error al conectar a {device_ip}: {str(e)}", "warning")
             return None
 
     def execute_command(self, ssh, command, device_ip):
-        """Ejecuta un comando y devuelve la salida"""
         try:
-            self.log_message(f"Ejecutando en {device_ip}: {command}")
             stdin, stdout, stderr = ssh.exec_command(command, timeout=self.command_timeout)
             output = stdout.read().decode('utf-8', errors='ignore').strip()
             error = stderr.read().decode('utf-8', errors='ignore').strip()
             
             if error and "Invalid input detected" not in error:
                 self.log_message(f"Error en {device_ip}: {error}", "warning")
-                return None, error
-            return output, None
+                return None
+            return output
         except Exception as e:
-            self.log_message(f"Error ejecutando comando en {device_ip}: {str(e)}", "warning")
-            return None, str(e)
+            self.log_message(f"Error ejecutando comando: {str(e)}", "warning")
+            return None
 
     def check_duplicate_ip(self, device_ip, device_type, target_ip):
-        """Verifica si la IP está en el dispositivo"""
         ssh = self.connect_to_device(device_ip, device_type)
         if not ssh:
-            return device_ip, device_type, None, f"Error de conexión a {device_ip}"
+            return None
         
         try:
-            # Determinar el comando según el tipo de dispositivo
             if 'huawei' in device_type.lower():
                 command = f"display ip routing-table {target_ip}"
+                search_patterns = [f"{target_ip}/", "Routing Table"]
             elif 'xe' in device_type.lower():
                 command = f"show ip route {target_ip}"
+                search_patterns = ["is directly connected", "is subnetted", f" {target_ip} "]
             elif 'xr' in device_type.lower():
                 command = f"show route {target_ip}"
+                search_patterns = [f" {target_ip}/", "Routing entry for"]
             else:
-                msg = f"Tipo no reconocido: {device_type}"
-                self.log_message(msg, "warning")
-                return device_ip, device_type, None, msg
+                self.log_message(f"Tipo no reconocido: {device_type}", "warning")
+                return None
             
-            output, error = self.execute_command(ssh, command, device_ip)
+            output = self.execute_command(ssh, command, device_ip)
             
-            if error:
-                return device_ip, device_type, None, error
-            
-            # Análisis detallado con logging
-            if output:
-                self.log_message(f"Respuesta de {device_ip}:\n{output[:200]}...")
-                
-                if 'huawei' in device_type.lower():
-                    if f"{target_ip}/" in output or "Routing Table" in output:
-                        self.log_message(f"IP encontrada en Huawei {device_ip}", "success")
-                        return device_ip, device_type, output, None
-                elif 'xe' in device_type.lower():
-                    if "is directly connected" in output or "is subnetted" in output or f" {target_ip} " in output:
-                        self.log_message(f"IP encontrada en IOS XE {device_ip}", "success")
-                        return device_ip, device_type, output, None
-                elif 'xr' in device_type.lower():
-                    if f" {target_ip}/" in output or "Routing entry for" in output:
-                        self.log_message(f"IP encontrada en IOS XR {device_ip}", "success")
-                        return device_ip, device_type, output, None
+            if output and any(pattern in output for pattern in search_patterns):
+                self.add_result(device_ip, device_type, output)
+                self.log_message(f"¡COINCIDENCIA ENCONTRADA en {device_ip}!", "success")
+                return True
             
             self.log_message(f"IP no encontrada en {device_ip}")
-            return device_ip, device_type, None, "IP no encontrada en la tabla de routing"
-        except Exception as e:
-            self.log_message(f"Error procesando {device_ip}: {str(e)}", "warning")
-            return device_ip, device_type, None, str(e)
+            return False
         finally:
             if ssh:
                 ssh.close()
 
     def process_devices(self, excel_data, target_ip):
-        """Procesa todos los dispositivos en el archivo Excel"""
         try:
             df = pd.read_excel(BytesIO(excel_data))
-            df['IP'] = df['IP'].astype(str).str.strip()
-            df['Tipo'] = df['Tipo'].astype(str).str.strip().str.lower()
-            devices = list(zip(df['IP'], df['Tipo']))
+            devices = [(str(row['IP']), str(row['Tipo']).lower()) for _, row in df.iterrows()]
         except Exception as e:
-            self.log_message(f"Error al procesar Excel: {str(e)}", "error")
-            return None
+            self.log_message(f"Error al leer Excel: {str(e)}", "error")
+            return False
         
-        self.log_message(f"🔍 Iniciando búsqueda de {target_ip} en {len(devices)} dispositivos")
+        self.log_message(f"Iniciando búsqueda de {target_ip} en {len(devices)} dispositivos")
         
-        found_devices = []
         start_time = time.time()
         total_devices = len(devices)
+        found_count = 0
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {
@@ -154,20 +123,19 @@ class NetworkDeviceScanner:
             for i, future in enumerate(as_completed(futures), 1):
                 device_ip, device_type = futures[future]
                 self.update_progress(i, total_devices)
-                result_ip, result_type, output, error = future.result()
-                
-                if output:
-                    found_devices.append((result_ip, result_type, output))
+                if future.result():
+                    found_count += 1
         
         elapsed_time = time.time() - start_time
-        self.log_message(f"⏱️ Tiempo total: {elapsed_time:.2f} segundos")
+        self.log_message(f"Búsqueda completada en {elapsed_time:.2f} segundos")
+        self.results_queue.put(("summary", found_count, total_devices, target_ip))
         
-        return found_devices
+        return found_count > 0
 
-def display_logs_and_progress(log_placeholder, progress_bar, progress_text, scanner):
-    """Muestra logs y progreso desde las colas (debe ejecutarse en el hilo principal)"""
+def display_ui_updates(log_placeholder, progress_bar, progress_text, results_area, scanner):
+    """Muestra actualizaciones en la UI desde el hilo principal"""
     while True:
-        # Procesar mensajes de log
+        # Procesar logs
         while not scanner.log_queue.empty():
             level, message = scanner.log_queue.get()
             if level == "error":
@@ -179,81 +147,75 @@ def display_logs_and_progress(log_placeholder, progress_bar, progress_text, scan
             else:
                 log_placeholder.info(message)
         
-        # Procesar actualizaciones de progreso
+        # Procesar progreso
         while not scanner.progress_queue.empty():
             current, total = scanner.progress_queue.get()
-            progress = current / total
-            progress_bar.progress(progress)
+            progress_bar.progress(current / total)
             progress_text.text(f"📡 Procesados: {current}/{total}")
+        
+        # Procesar resultados
+        while not scanner.results_queue.empty():
+            result_type, *data = scanner.results_queue.get()
+            if result_type == "found":
+                device_ip, device_type, output = data
+                with results_area.expander(f"✅ Coincidencia en {device_ip} ({device_type})", expanded=True):
+                    st.code(output)
+            elif result_type == "summary":
+                found_count, total_devices, target_ip = data
+                if found_count > 0:
+                    results_area.success(f"🎯 Se encontró {target_ip} en {found_count} dispositivos")
+                else:
+                    results_area.warning(f"La IP {target_ip} no se encontró en ninguno de los {total_devices} dispositivos")
         
         time.sleep(0.1)
 
 def main():
-    st.set_page_config(page_title="Network IP Scanner Fixed", layout="wide")
+    st.set_page_config(page_title="Buscador de IP en Red", layout="wide")
+    st.title("🔍 Buscador de IP en Dispositivos de Red")
     
-    st.title("🌐 Network IP Scanner - Versión Estable")
-    st.markdown("""
-    **Versión corregida** con manejo adecuado de threads y logging
-    """)
-    
-    # Sidebar
     with st.sidebar:
-        st.header("🔐 Credenciales SSH")
+        st.header("Credenciales SSH")
         username = st.text_input("Usuario", "juribeb")
         password = st.text_input("Contraseña", type="password")
-        
-        st.markdown("---")
-        st.info("""
-        - Columna 'IP': Direcciones de los dispositivos
-        - Columna 'Tipo': IOS XE, IOS XR o Huawei
-        """)
     
-    # Área principal
     uploaded_file = st.file_uploader("Sube archivo Excel con dispositivos", type=['xlsx'])
     
-    if uploaded_file is not None:
+    if uploaded_file:
         target_ip = st.text_input("IP a buscar", "172.20.142.85")
         
-        if st.button("🚀 Iniciar Escaneo", use_container_width=True):
-            # Configurar elementos de UI
+        if st.button("Iniciar Búsqueda"):
+            # Configurar áreas de visualización
             progress_bar = st.progress(0)
             progress_text = st.empty()
             log_container = st.expander("📝 Logs de Ejecución", expanded=True)
             log_placeholder = log_container.empty()
-            results_placeholder = st.empty()
+            results_area = st.container()
             
-            # Crear scanner
+            # Iniciar escaneo
             scanner = NetworkDeviceScanner(username, password)
             
-            # Mostrar estado inicial
-            log_placeholder.info("Preparando escaneo...")
-            
-            # Ejecutar el escaneo en un thread separado
             def run_scan():
                 try:
-                    found_devices = scanner.process_devices(uploaded_file.read(), target_ip)
-                    
-                    # Mostrar resultados finales
-                    results_placeholder.empty()
-                    if found_devices:
-                        results_placeholder.success(f"🎯 IP encontrada en {len(found_devices)} dispositivos:")
-                        for device_ip, device_type, _ in found_devices:
-                            results_placeholder.write(f"- {device_ip} ({device_type})")
-                    else:
-                        results_placeholder.warning(f"La IP {target_ip} no se encontró en ningún dispositivo")
+                    has_matches = scanner.process_devices(uploaded_file.read(), target_ip)
+                    if not has_matches:
+                        scanner.results_queue.put(("summary", 0, len(pd.read_excel(BytesIO(uploaded_file.read()))), target_ip))
                 except Exception as e:
                     log_placeholder.error(f"Error en el escaneo: {str(e)}")
             
-            # Iniciar el escaneo en un thread
             import threading
             scan_thread = threading.Thread(target=run_scan)
             scan_thread.start()
             
-            # Procesar logs y progreso en el hilo principal
+            # Mostrar actualizaciones
             while scan_thread.is_alive():
-                display_logs_and_progress(log_placeholder, progress_bar, progress_text, scanner)
+                display_ui_updates(log_placeholder, progress_bar, progress_text, results_area, scanner)
                 time.sleep(0.1)
             
+            # Procesar cualquier mensaje restante
+            display_ui_updates(log_placeholder, progress_bar, progress_text, results_area, scanner)
+
+if __name__ == "__main__":
+    main()
             # Procesar cualquier mensaje restante
             display_logs_and_progress(log_placeholder, progress_bar, progress_text, scanner)
 
