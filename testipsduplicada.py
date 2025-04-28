@@ -130,8 +130,8 @@ def main():
     print("Usando ThreadPool para ejecución paralela\n")
     
     # Solicitar credenciales
-    username = "juribeb"
-    password = "Gravy201219@"
+    username = ""
+    password = ""
     
     # Crear scanner
     scanner = NetworkDeviceScanner(username, password)
